@@ -69,6 +69,13 @@ class TestMemory:
         c = self._run(ColorCode(distance=3), ColorCodeExtractionBlock)
         assert_valid_circuit(c); assert_noiseless(c); assert_dem_valid(c)
 
+    @pytest.mark.parametrize("basis", ["Z", "X"])
+    def test_six_two_two_code(self, basis):
+        from lightstim.qec_code.six_two_two import SixTwoTwoCode, SixTwoTwoExtractionBlock
+        c = self._run(SixTwoTwoCode(), SixTwoTwoExtractionBlock, basis)
+        assert_valid_circuit(c); assert_noiseless(c); assert_dem_valid(c)
+        assert c.num_observables == 2, f"[[6,2,2]] encodes k=2, got {c.num_observables}"
+
     def test_qec_patch_interface_infers_default_extraction_block(self):
         from lightstim.protocols.memory import MemoryExperiment
         from lightstim.qec_code.color_code import (
