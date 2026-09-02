@@ -3,9 +3,10 @@ End-to-end Magic-H6 benchmark runner for LightStim.
 
 Runs both H6 levels:
 - Level 1: [[6,2,2]] with detector/observable scoring via run_simulation
-- Level 2: [[36,4,4]] framework-native circuit, tracker detector/observable scoring
-  via run_simulation_level2 (LER is a conservative upper bound -- see the protocol
-  module docstring's "Known limitations")
+- Level 2: [[36,4,4]] framework-native circuit, scored by run_simulation_level2 --
+  detector post-selection + the explicit level-2 logical / outer-stabilizer
+  observable split (LER is still noise-model-limited; see the protocol module
+  docstring's "Known limitations")
 
 Results are appended to CSV with checkpoint skipping.
 
@@ -18,9 +19,12 @@ Usage
     PYTHONPATH=. python benchmarks/magic_h6_benchmark/run_magic_h6_benchmark.py \
         --levels 1 --p-values 1e-3 2e-3 5e-3
 
-    # Level 2 custom sweep (level 2 needs lower p than level 1)
+    # Level 2 custom sweep (level 2 needs lower p than level 1; the
+    # --max-errors-l2 early-stop keeps low-acceptance points from burning the
+    # full --num-samples-l2 budget)
     PYTHONPATH=. python benchmarks/magic_h6_benchmark/run_magic_h6_benchmark.py \
-        --levels 2 --p-values-l2 3e-4 5e-4 1e-3 --num-samples-l2 500000
+        --levels 2 --p-values-l2 3e-4 5e-4 1e-3 \
+        --num-samples-l2 2000000 --max-errors-l2 100
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ _COLUMNS = [
     "max_shots_l1",
     "max_errors_l1",
     "num_samples_l2",
+    "max_errors_l2",
     "shots",
     "accepted",
     "failed",
@@ -123,6 +128,7 @@ def _run_level1(args, out_path: Path) -> None:
             "max_shots_l1": args.max_shots_l1,
             "max_errors_l1": args.max_errors_l1,
             "num_samples_l2": args.num_samples_l2,
+            "max_errors_l2": args.max_errors_l2,
         }
         if _ck_key(row_prefix) in done:
             print(f"  SKIP L1 p={p:.2e}")
@@ -167,7 +173,12 @@ def _run_level2(args, out_path: Path) -> None:
     data_indices = list(system.data_indices)
     done = _load_done(out_path)
 
-    for p in args.p_values_l2:
+    # Fall back to the level-1 grid when no separate L2 grid is supplied
+    # (matches the "p_values_l2=None -> reuse p_values" contract; the CLI in
+    # main() always sets this attribute explicitly).
+    p_values_l2 = getattr(args, "p_values_l2", None) or args.p_values
+
+    for p in p_values_l2:
         row_prefix = {
             "level": 2,
             "code": info["code"],
@@ -178,6 +189,7 @@ def _run_level2(args, out_path: Path) -> None:
             "max_shots_l1": args.max_shots_l1,
             "max_errors_l1": args.max_errors_l1,
             "num_samples_l2": args.num_samples_l2,
+            "max_errors_l2": args.max_errors_l2,
         }
         if _ck_key(row_prefix) in done:
             print(f"  SKIP L2 p={p:.2e}")
@@ -192,6 +204,8 @@ def _run_level2(args, out_path: Path) -> None:
             mode=args.mode,
             data_indices=data_indices,
             num_samples=args.num_samples_l2,
+            batch_size=args.batch_size_l2,
+            max_errors=args.max_errors_l2 or None,  # 0 -> no early stop
         )
         elapsed = time.perf_counter() - t0
 
@@ -209,7 +223,8 @@ def _run_level2(args, out_path: Path) -> None:
             "    -> "
             f"accept={stats['post_selection_rate']:.4f}, "
             f"LER={stats['logical_error_rate']:.3e}, "
-            f"shots={stats['shots']}",
+            f"shots={stats['shots']}, "
+            f"errors={stats['failed']}",
             flush=True,
         )
 
@@ -232,7 +247,9 @@ def main() -> None:
         help=(
             "Level-2 physical error rates to sweep. Lower than level 1: the "
             "20-patch circuit post-selects on ~120 detectors, so acceptance "
-            "collapses above ~1e-3."
+            "collapses above ~1e-3 (at p=1e-2 acceptance is ~1e-3 -- pure "
+            "post-selection cannot get statistics there, so it is left off "
+            "this grid)."
         ),
     )
     ap.add_argument(
@@ -248,8 +265,19 @@ def main() -> None:
     ap.add_argument("--max-errors-l1", type=int, default=80)
     ap.add_argument("--batch-size-l1", type=int, default=20_000)
 
-    # Level-2 simulation controls.
-    ap.add_argument("--num-samples-l2", type=int, default=200_000)
+    # Level-2 simulation controls. num-samples-l2 is a hard cap; max-errors-l2
+    # is the level-1-style early-stop (stop once this many surviving shots have
+    # failed, so a high-p point with usable acceptance does not burn the whole
+    # sample budget). Set --max-errors-l2 to 0 to disable early stopping.
+    ap.add_argument("--num-samples-l2", type=int, default=1_000_000)
+    ap.add_argument("--max-errors-l2", type=int, default=100)
+    ap.add_argument(
+        "--batch-size-l2",
+        type=int,
+        default=25_000,
+        help="Level-2 shots per sampling batch (sets the --max-errors-l2 "
+        "early-stop granularity; not a result knob).",
+    )
 
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--print-progress", action="store_true")
@@ -267,7 +295,9 @@ def main() -> None:
         args.max_shots_l1 = 20_000
         args.max_errors_l1 = 20
         args.batch_size_l1 = 5_000
-        args.num_samples_l2 = 20_000
+        args.num_samples_l2 = 50_000
+        args.max_errors_l2 = 20
+        args.batch_size_l2 = 10_000
 
     out_path = (
         Path(args.output)
@@ -285,6 +315,7 @@ def main() -> None:
     print(f"max_shots_l1   : {args.max_shots_l1}")
     print(f"max_errors_l1  : {args.max_errors_l1}")
     print(f"num_samples_l2 : {args.num_samples_l2}")
+    print(f"max_errors_l2  : {args.max_errors_l2}")
     print(f"num_workers    : {args.num_workers}")
     print(f"output         : {out_path}")
     print("=" * 64)

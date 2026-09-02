@@ -86,6 +86,55 @@ def test_run_simulation_level2_smoke_with_noise():
     assert 0 <= stats["failed"] <= stats["accepted"]
 
 
+def test_run_simulation_level2_scores_far_below_level1():
+    # Regression guard for the observable-split fix: run_simulation_level2 must
+    # count only the 4 genuine [[36,4,4]] logicals, not first-order stabilizer
+    # excitations. Pre-fix this LER was ~1.7e-2 at p=2e-3 (>= the level-1 rate);
+    # with the correct split it is ~1e-4 (quadratic distillation gain).
+    circ, info, system = build_h6_circuit(level=2)
+    assert len(info["target_observable_indices"]) == 4
+    stats = run_simulation_level2(
+        circ,
+        p=2e-3,
+        info=info,
+        mode="full",
+        data_indices=list(system.data_indices),
+        num_samples=200_000,
+        batch_size=50_000,
+    )
+    assert stats["accepted"] > 1_000
+    assert stats["logical_error_rate"] < 5e-3
+
+
+def test_run_simulation_level2_max_errors_early_stop():
+    # The level-1-style early-stop: with max_errors set, sampling stops on the
+    # first batch boundary after that many surviving shots have failed. At
+    # p=3e-3 acceptance is ~2.5% and the (correct) LER ~5e-4, so a 1e6-shot
+    # budget accumulates failures many times over -> the cap always trips first.
+    circ, info, system = build_h6_circuit(level=2)
+    stats = run_simulation_level2(
+        circ,
+        p=3e-3,
+        info=info,
+        mode="full",
+        data_indices=list(system.data_indices),
+        num_samples=1_000_000,
+        batch_size=50_000,
+        max_errors=1,
+    )
+    assert stats["failed"] >= 1               # stopped because the cap was hit
+    assert stats["shots"] < 1_000_000         # ... not because the budget ran out
+    assert stats["shots"] % 50_000 == 0       # stopped on a batch boundary
+
+    full = run_simulation_level2(
+        circ, p=0.0, info=info, data_indices=list(system.data_indices),
+        num_samples=4096, batch_size=1024, max_errors=5,
+    )
+    assert full["shots"] == 4096              # no failures -> samples the full cap
+    with pytest.raises(ValueError):
+        run_simulation_level2(circ, p=1e-3, info=info, num_samples=64, max_errors=0)
+
+
 def test_inject_noise_modes():
     circ, _, system = build_h6_circuit(level=1)
     di = list(system.data_indices)
