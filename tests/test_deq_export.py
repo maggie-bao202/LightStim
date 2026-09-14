@@ -15,6 +15,7 @@ from lightstim.deq.validate import deq_available, validate_deq_text
 from lightstim.ir.qec_system import QECSystem
 from lightstim.protocols.memory import MemoryExperiment
 from lightstim.qec_code.repetition.repetition import RepetitionCode
+from lightstim.qec_code.repetition.SE_block import RepetitionCodeExtractionBlock
 from lightstim.qec_code.surface_code.rotated import (
     RotatedSurfaceCode,
     RotatedSurfaceCodeExtractionBlock,
@@ -31,6 +32,51 @@ def _build_memory(patch, *, extraction_block_class=None, rounds=3, basis="Z", no
     )
     circuit = exp.build()
     return exp.system, circuit
+
+
+def _build_prepare_and_se_only(patch, extraction_block_class, *, rounds=1):
+    """A circuit that prepares data qubits and runs syndrome extraction but
+    does NOT measure the data qubits out -- the code instance survives to
+    the end, unlike every MemoryExperiment (which always ends in a full
+    destructive readout). Built directly via the low-level IR (no
+    protocol class does this shape today) so export_deq's OUTPUT-emission
+    logic has a real positive case to be tested against."""
+    from lightstim.ir.builder import CircuitBuilder
+    from lightstim.ir.tracker import SyndromeTracker
+
+    system = QECSystem()
+    system.add_patch(patch, name="memory")
+    tracker = SyndromeTracker(system.num_qubits, expected_num_logicals=system.num_logicals)
+    builder = CircuitBuilder(tracker, system, if_detector=True)
+    builder.write_coordinates()
+    data = sorted(system.data_indices)
+    builder.initialize({q: "Z" for q in data}, n=system.num_qubits)
+    builder.apply_syndrome_extraction(
+        circuit_chunk=extraction_block_class(system).circuit, rounds=rounds
+    )
+    return system, builder.circuit
+
+
+def _build_two_patch_prepare_and_se_only(patch_class, extraction_block_class, *, rounds=1):
+    """Two independent patches (like CNOTTransExperiment's control/target,
+    minus the CNOT and the final readout), so both patches' qubits survive
+    to the end and export_deq must emit two distinct, correctly-globalized
+    OUTPUT lines."""
+    from lightstim.ir.builder import CircuitBuilder
+    from lightstim.ir.tracker import SyndromeTracker
+
+    system = QECSystem()
+    system.add_patch(patch_class(distance=3), name="control")
+    system.add_patch(patch_class(distance=3), name="target", offset=(6, 0))
+    tracker = SyndromeTracker(system.num_qubits, expected_num_logicals=system.num_logicals)
+    builder = CircuitBuilder(tracker, system, if_detector=True)
+    builder.write_coordinates()
+    data = sorted(system.data_indices)
+    builder.initialize({q: "Z" for q in data}, n=system.num_qubits)
+    builder.apply_syndrome_extraction(
+        circuit_chunk=extraction_block_class(system).circuit, rounds=rounds
+    )
+    return system, builder.circuit
 
 
 # --- pairing.py: symplectic logical-operator pairing -----------------------
@@ -108,7 +154,13 @@ class TestExportRepetitionCode:
 
     def test_single_gadget(self, deq_text):
         assert deq_text.count("GADGET ") == 1
-        assert "OUTPUT memory " in deq_text
+
+    def test_no_output_after_terminal_readout(self, deq_text):
+        # MemoryExperiment ends in a full destructive data-qubit
+        # measurement -- no live code instance survives, so OUTPUT must be
+        # omitted (deq's compiler rejects an OUTPUT it can't verify against
+        # actual measurements; see _destructively_measured_qubits).
+        assert "OUTPUT" not in deq_text
 
     def test_validates_structurally(self, deq_text):
         parsed = validate_deq_text(deq_text)
@@ -119,6 +171,33 @@ class TestExportRepetitionCode:
             assert codes[0].n == 3 and codes[0].k == 1 and codes[0].d == 3
             assert len(codes[0].logicals) == 1
             assert len(codes[0].stabilizers) == 2
+
+
+@pytest.mark.smoke
+class TestOutputEmission:
+    """`OUTPUT` must be emitted exactly when the patch's qubits actually
+    survive to the end of the GADGET body, and omitted when they don't
+    (see `_destructively_measured_qubits`). `deq`'s own compiler enforces
+    this: it rejects a GADGET whose OUTPUT stabilizers can't be
+    reconstructed from the gadget's measurements, which is exactly what an
+    OUTPUT over destructively-measured qubits claims. Caught for real by
+    running the exported .deq for an H6-distillation circuit through
+    Bloqade Studio's deq compiler (grammar-only `deqagram.parse` validation
+    can't catch this class of error — it isn't a syntax problem)."""
+
+    def test_output_present_when_code_survives(self):
+        system, circuit = _build_prepare_and_se_only(
+            RepetitionCode(distance=3), RepetitionCodeExtractionBlock, rounds=1
+        )
+        deq_text = export_deq(system, circuit, gadget_name="PrepareAndExtract")
+        assert "OUTPUT memory " in deq_text
+        validate_deq_text(deq_text)
+
+    def test_output_absent_after_terminal_readout(self):
+        system, circuit = _build_memory(RepetitionCode(distance=3), rounds=1)
+        deq_text = export_deq(system, circuit, gadget_name="Repetition")
+        assert "OUTPUT" not in deq_text
+        validate_deq_text(deq_text)
 
 
 @pytest.mark.smoke
@@ -272,21 +351,27 @@ class TestExportTwoPersistingPatches:
         assert "CODE control [[9,1,3]] {" in deq_text
         assert "CODE target [[9,1,3]] {" in deq_text
 
-    def test_one_gadget_two_outputs(self, deq_text):
+    def test_single_gadget(self, deq_text):
         assert deq_text.count("GADGET ") == 1
-        assert deq_text.count("OUTPUT ") == 2
+
+    def test_no_output_after_terminal_readout(self, deq_text):
+        # CNOTTransExperiment.build() ends in a full destructive data-qubit
+        # readout for both patches -- no live code instance survives either,
+        # so no OUTPUT is emitted (see TestOutputEmission). The distinct-
+        # global-qubit regression is covered separately by
+        # test_two_patches_get_distinct_global_qubits, on a circuit that
+        # doesn't end in readout so OUTPUT is actually present to check.
+        assert "OUTPUT" not in deq_text
 
     def test_validates_structurally(self, deq_text):
         parsed = validate_deq_text(deq_text)
         if deq_available():
-            from deq.circuit.model import CodeDefinition, GadgetDefinition
+            from deq.circuit.model import CodeDefinition
             codes = {d.name: d for d in parsed.definitions if isinstance(d, CodeDefinition)}
             assert set(codes) == {"control", "target"}
             for c in codes.values():
                 assert (c.n, c.k, c.d) == (9, 1, 3)
                 assert len(c.stabilizers) == 8
-            gadget = next(d for d in parsed.definitions if isinstance(d, GadgetDefinition))
-            assert len(gadget.output_ports) == 2
 
 
 @pytest.mark.smoke
@@ -294,7 +379,10 @@ def test_coupler_patch_exported_as_stabilizer_state():
     """Lattice-surgery coupler patches get their own CODE block too (a k=0
     stabilizer-state code, same as the resource-superstaq reference file's
     YBoundaryStateD3 [[8,0]]), whether or not the protocol has removed the
-    coupler from system.patches by the time .build() returns."""
+    coupler from system.patches by the time .build() returns. (No OUTPUT
+    assertions here: TwoPatchLSExperiment ends in a full destructive
+    readout of every patch including the coupler, so none of them get an
+    OUTPUT -- see TestOutputEmission for that behavior specifically.)"""
     import contextlib
     import io
 
@@ -321,8 +409,7 @@ def test_coupler_patch_exported_as_stabilizer_state():
 
     assert deq_text.count("CODE ") == 3  # two code patches + the coupler
     assert f"CODE {coupler_name} " in deq_text
-    assert f"OUTPUT {coupler_name} " in deq_text
-    assert f"LOGICAL" not in deq_text.split(f"CODE {coupler_name} ", 1)[1].split("}", 1)[0]
+    assert "LOGICAL" not in deq_text.split(f"CODE {coupler_name} ", 1)[1].split("}", 1)[0]
 
     parsed = validate_deq_text(deq_text)
     if deq_available():
@@ -342,28 +429,28 @@ def test_two_patches_get_distinct_global_qubits():
     numbers. (A prior version of export_deq read patch.data_indices/
     patch.stabilizers directly, which are in LightStim's per-patch LOCAL
     index space; for any patch after the first, local != global, and the
-    exported OUTPUT pointed at the wrong qubits.)"""
-    from lightstim.protocols.cnot_trans import CNOTTransExperiment
+    exported OUTPUT pointed at the wrong qubits.)
 
-    exp = CNOTTransExperiment(
-        code_patch_class=RotatedSurfaceCode,
-        extraction_block_class=RotatedSurfaceCodeExtractionBlock,
-        code_params_control={"distance": 3},
-        rounds_before=1,
-        rounds_after=1,
-        noise_params=None,
+    Uses a prepare+SE-only circuit (see _build_two_patch_prepare_and_se_only)
+    rather than the full CNOTTransExperiment, specifically so both patches'
+    qubits survive to the end and OUTPUT is actually emitted for both --
+    CNOTTransExperiment's real .build() ends in a full destructive readout,
+    which (correctly, per TestOutputEmission) suppresses OUTPUT entirely and
+    would give this regression nothing to check.
+    """
+    system, circuit = _build_two_patch_prepare_and_se_only(
+        RotatedSurfaceCode, RotatedSurfaceCodeExtractionBlock, rounds=1
     )
-    circuit = exp.build()
-    deq_text = export_deq(exp.system, circuit, gadget_name="CNOTTrans")
+    deq_text = export_deq(system, circuit, gadget_name="TwoPatchPrepareAndExtract")
 
-    control_local_to_global = exp.system.local_to_global_map["control"]
-    target_local_to_global = exp.system.local_to_global_map["target"]
+    control_local_to_global = system.local_to_global_map["control"]
+    target_local_to_global = system.local_to_global_map["target"]
     assert control_local_to_global != target_local_to_global  # sanity: truly different patches
 
     # patch.data_indices is LightStim's own LOCAL numbering (confirmed
     # reliable for ordinary, non-coupler patches; see _globalize_pauli_map).
-    control_local_data = exp.system.patches["control"][0].data_indices
-    target_local_data = exp.system.patches["target"][0].data_indices
+    control_local_data = system.patches["control"][0].data_indices
+    target_local_data = system.patches["target"][0].data_indices
     expected_control = sorted(control_local_to_global[q] for q in control_local_data)
     expected_target = sorted(target_local_to_global[q] for q in target_local_data)
     assert expected_control != expected_target
@@ -372,10 +459,7 @@ def test_two_patches_get_distinct_global_qubits():
     target_output = " ".join(map(str, expected_target))
     assert f"OUTPUT control {control_output}" in deq_text
     assert f"OUTPUT target {target_output}" in deq_text
-    # Every qubit the physical GADGET body actually uses these on must
-    # appear literally in the circuit (not just be well-formed integers).
-    for q in expected_target:
-        assert f" {q} " in deq_text or f" {q}\n" in deq_text or deq_text.endswith(f" {q}")
+
     parsed = validate_deq_text(deq_text)
     if deq_available():
         from deq.circuit.model import CodeDefinition

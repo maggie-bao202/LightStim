@@ -4,12 +4,28 @@ Converts a LightStim ``QECSystem`` (for its ``CODE`` block: stabilizers and
 logical operators) plus the matching ``stim.Circuit`` (for the ``GADGET``
 body) into ``.deq`` text.
 
-Any number of patches is supported (one ``CODE`` block + one ``OUTPUT``
-declaration per patch, in a single GADGET). Decomposing a circuit into
-separate Prepare/SyndromeExtraction/Measure/merge GADGETs wired via
-``COMPOSE`` (as LightStim's lattice-surgery protocols would naturally map
-onto) is still future work — see the Light-DEQ plan and the note on
-``export_deq`` for why that split isn't just a refactor.
+Any number of patches is supported: one ``CODE`` block per patch, in a
+single GADGET, each with an ``OUTPUT`` declaration IF AND ONLY IF that
+patch's qubits still hold live quantum state at the end of the circuit (see
+``_destructively_measured_qubits``) — a circuit ending in a full data-qubit
+readout (every ``MemoryExperiment``, for instance) emits no ``OUTPUT`` at
+all, matching the resource-superstaq reference file's own convention
+(compare its ``PrepareZ``/``SyndromeExtraction`` gadgets, which end mid-code
+and declare ``OUTPUT``, against ``MeasureZ``, which doesn't). This isn't
+just a style choice: ``deq``'s own compiler verifies that every declared
+``OUTPUT`` stabilizer is reconstructible from the gadget's measurements
+("automatic check discovery"), and correctly rejects a GADGET that claims a
+destructively-measured qubit set is still a valid code instance — caught for
+real running an early, over-eager version of this exporter's output through
+Bloqade Studio's ``deq`` compile step (grammar-only ``deqagram.parse``
+validation, which this module still relies on day to day since there's no
+local Rust toolchain, does NOT catch this class of error — it isn't a syntax
+problem).
+
+Decomposing a circuit into separate Prepare/SyndromeExtraction/Measure/merge
+GADGETs wired via ``COMPOSE`` (as LightStim's lattice-surgery protocols
+would naturally map onto) is still future work — see the Light-DEQ plan and
+the note on ``export_deq`` for why that split isn't just a refactor.
 
 Noisy circuits export fine: deq's ``instruction`` grammar rule is a generic
 ``IDENT tag? (args)? target*`` and Stim's noise channels (``X_ERROR``,
@@ -19,10 +35,7 @@ noisy ``MemoryExperiment`` circuit through the real ``deq``/``deqagram``
 grammar. (Do not confuse this with deq's own native ``ERROR(p) <target>``
 statement, which is a different thing: it only accepts CHECK/READOUT/LOGICAL
 targets and injects a probabilistic flip on an already-abstracted outcome,
-not per-qubit physical noise — this module never emits it.) Note this
-exporter's validation is grammar-level only (round-tripped through
-``deqagram.parse``, not compiled via the Rust-toolchain-only ``deq
-transpile``), so that caveat applies equally to noisy and noiseless circuits.
+not per-qubit physical noise — this module never emits it.)
 """
 
 import stim
@@ -39,6 +52,11 @@ _DROP_INSTRUCTIONS = {"QUBIT_COORDS", "SHIFT_COORDS"}
 # Native deq synonyms of CHECK/READOUT that carry no (...) argument slot in
 # the deq grammar, unlike Stim's own DETECTOR(x, y, t) / OBSERVABLE_INCLUDE(k).
 _STRIP_ARGS_INSTRUCTIONS = {"DETECTOR", "OBSERVABLE_INCLUDE"}
+# Plain (non-resetting) measurements: after one of these, a qubit holds no
+# further live quantum state (unlike MR/MRX/MRY, which reset it back to a
+# known state it could still carry code data in). Used to detect a qubit
+# that's been destructively measured out by the end of the GADGET body.
+_TERMINAL_MEASUREMENT_INSTRUCTIONS = {"M", "MZ", "MX", "MY"}
 
 
 def _format_float(value: float) -> str:
@@ -97,6 +115,30 @@ def _circuit_lines(circuit: "stim.Circuit", indent: int = 1) -> list[str]:
             if line is not None:
                 lines.append(f"{pad}{line}")
     return lines
+
+
+def _destructively_measured_qubits(circuit: "stim.Circuit") -> set:
+    """Qubits whose LAST touch in `circuit` is a plain (non-resetting)
+    measurement — i.e. they hold no live quantum state by the end of the
+    GADGET body, having been destructively measured out rather than
+    handed off as a still-valid code instance.
+
+    Used to decide whether a patch's OUTPUT declaration should be emitted
+    at all: `deq`'s compiler verifies that every declared OUTPUT stabilizer
+    is reconstructible from the gadget's own measurements (its "automatic
+    check discovery"), and correctly rejects an OUTPUT over qubits that
+    were actually consumed by a terminal readout — there's no code left to
+    output. Matches the convention already used by the resource-superstaq
+    reference file: its `MeasureZ`/`MeasureX` gadgets end in a plain `MZ`/
+    `MX` and declare no `OUTPUT` at all.
+    """
+    last_is_measurement: dict = {}
+    for instruction in circuit.flattened():
+        is_measurement = instruction.name in _TERMINAL_MEASUREMENT_INSTRUCTIONS
+        for target in instruction.targets_copy():
+            if target.is_qubit_target:
+                last_is_measurement[target.value] = is_measurement
+    return {q for q, measured in last_is_measurement.items() if measured}
 
 
 def _pauli_product_text(pauli_map: dict, local_id: dict) -> str:
@@ -279,6 +321,8 @@ def export_deq(
     if not system.patches:
         raise DeqExportError("system has no patches to export")
 
+    consumed_qubits = _destructively_measured_qubits(circuit)
+
     code_names = code_names or {}
     sections = []
     output_ports = []
@@ -301,7 +345,13 @@ def export_deq(
         ]
         qubits = _code_qubit_universe(stabilizers, logical_ops)
         sections.append(_code_block_text(patch, code_name, stabilizers, logical_ops, qubits))
-        output_ports.append((code_name, qubits))
+        # Skip OUTPUT entirely if this patch's qubits were all destructively
+        # measured out (a terminal readout, e.g. ending in MX) — there's no
+        # live code instance left to claim as this CODE's OUTPUT, and
+        # deq's compiler correctly rejects that claim (see
+        # _destructively_measured_qubits' docstring).
+        if not (set(qubits) <= consumed_qubits):
+            output_ports.append((code_name, qubits))
 
     sections.append(_gadget_block_text(gadget_name, circuit, output_ports=output_ports))
 
