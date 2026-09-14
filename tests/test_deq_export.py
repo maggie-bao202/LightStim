@@ -21,12 +21,12 @@ from lightstim.qec_code.surface_code.rotated import (
 )
 
 
-def _build_memory(patch, *, extraction_block_class=None, rounds=3, basis="Z"):
+def _build_memory(patch, *, extraction_block_class=None, rounds=3, basis="Z", noise_params=None):
     exp = MemoryExperiment(
         qec_patch=patch,
         extraction_block_class=extraction_block_class,
         rounds=rounds,
-        noise_params=None,  # noiseless, per the Light-DEQ export convention
+        noise_params=noise_params,  # noiseless by default; noisy also exports fine (see below)
         basis=basis,
     )
     circuit = exp.build()
@@ -119,6 +119,34 @@ class TestExportRepetitionCode:
             assert codes[0].n == 3 and codes[0].k == 1 and codes[0].d == 3
             assert len(codes[0].logicals) == 1
             assert len(codes[0].stabilizers) == 2
+
+
+@pytest.mark.smoke
+def test_noisy_circuit_exports_and_validates():
+    """Noisy circuits export fine: Stim's noise channels (X_ERROR,
+    DEPOLARIZE1/2, ...) aren't reserved GADGET keywords, so they pass
+    through as ordinary instructions. Do not confuse this with deq's own
+    ERROR(p) <target> statement (CHECK/READOUT/LOGICAL only) — this module
+    never emits that."""
+    from lightstim.noise.config import NoiseConfig
+
+    noise = NoiseConfig(p_1q=1e-3, p_2q=1e-3, p_meas=1e-3, p_reset=1e-3)
+    system, circuit = _build_memory(RepetitionCode(distance=3), rounds=2, noise_params=noise)
+    assert "X_ERROR" in str(circuit) or "DEPOLARIZE" in str(circuit)  # sanity: actually noisy
+
+    deq_text = export_deq(system, circuit, gadget_name="NoisyRepetition")
+    assert "X_ERROR(" in deq_text or "DEPOLARIZE" in deq_text
+
+    parsed = validate_deq_text(deq_text)
+    if deq_available():
+        from deq.circuit.model import Instruction
+        gadget_instructions = {
+            i.name
+            for d in parsed.definitions
+            for i in getattr(d, "body", [])
+            if isinstance(i, Instruction)
+        }
+        assert gadget_instructions & {"X_ERROR", "DEPOLARIZE1", "DEPOLARIZE2"}
 
 
 # --- export_deq: rotated surface code (primary Light-DEQ target) -----------
@@ -262,10 +290,11 @@ class TestExportTwoPersistingPatches:
 
 
 @pytest.mark.smoke
-def test_coupler_patch_excluded_from_export():
-    """Lattice-surgery coupler patches are ephemeral merge/split ancilla, not
-    tracked codes: export_deq must exclude them from CODE/OUTPUT generation
-    even when the protocol leaves them in system.patches after .build()."""
+def test_coupler_patch_exported_as_stabilizer_state():
+    """Lattice-surgery coupler patches get their own CODE block too (a k=0
+    stabilizer-state code, same as the resource-superstaq reference file's
+    YBoundaryStateD3 [[8,0]]), whether or not the protocol has removed the
+    coupler from system.patches by the time .build() returns."""
     import contextlib
     import io
 
@@ -287,11 +316,66 @@ def test_coupler_patch_excluded_from_export():
         circuit = exp.build()
 
     assert exp.system.coupler_patches, "test assumes the coupler is still present after build()"
+    coupler_name = next(iter(exp.system.coupler_patches))
     deq_text = export_deq(exp.system, circuit, gadget_name="TwoPatchLS")
 
-    assert deq_text.count("CODE ") == 2  # coupler excluded
-    for coupler_name in exp.system.coupler_patches:
-        assert coupler_name not in deq_text
+    assert deq_text.count("CODE ") == 3  # two code patches + the coupler
+    assert f"CODE {coupler_name} " in deq_text
+    assert f"OUTPUT {coupler_name} " in deq_text
+    assert f"LOGICAL" not in deq_text.split(f"CODE {coupler_name} ", 1)[1].split("}", 1)[0]
+
+    parsed = validate_deq_text(deq_text)
+    if deq_available():
+        from deq.circuit.model import CodeDefinition
+        codes = {d.name: d for d in parsed.definitions if isinstance(d, CodeDefinition)}
+        assert set(codes) == set(exp.system.patches)
+        coupler_code = codes[coupler_name]
+        assert coupler_code.k == 0
+        assert len(coupler_code.logicals) == 0
+        assert len(coupler_code.stabilizers) > 0
+
+
+@pytest.mark.smoke
+def test_two_patches_get_distinct_global_qubits():
+    """Regression test: a non-first patch's OUTPUT must use its own physical
+    (global) qubits, not silently alias the first patch's local-index-shaped
+    numbers. (A prior version of export_deq read patch.data_indices/
+    patch.stabilizers directly, which are in LightStim's per-patch LOCAL
+    index space; for any patch after the first, local != global, and the
+    exported OUTPUT pointed at the wrong qubits.)"""
+    from lightstim.protocols.cnot_trans import CNOTTransExperiment
+
+    exp = CNOTTransExperiment(
+        code_patch_class=RotatedSurfaceCode,
+        extraction_block_class=RotatedSurfaceCodeExtractionBlock,
+        code_params_control={"distance": 3},
+        rounds_before=1,
+        rounds_after=1,
+        noise_params=None,
+    )
+    circuit = exp.build()
+    deq_text = export_deq(exp.system, circuit, gadget_name="CNOTTrans")
+
+    control_local_to_global = exp.system.local_to_global_map["control"]
+    target_local_to_global = exp.system.local_to_global_map["target"]
+    assert control_local_to_global != target_local_to_global  # sanity: truly different patches
+
+    # patch.data_indices is LightStim's own LOCAL numbering (confirmed
+    # reliable for ordinary, non-coupler patches; see _globalize_pauli_map).
+    control_local_data = exp.system.patches["control"][0].data_indices
+    target_local_data = exp.system.patches["target"][0].data_indices
+    expected_control = sorted(control_local_to_global[q] for q in control_local_data)
+    expected_target = sorted(target_local_to_global[q] for q in target_local_data)
+    assert expected_control != expected_target
+
+    control_output = " ".join(map(str, expected_control))
+    target_output = " ".join(map(str, expected_target))
+    assert f"OUTPUT control {control_output}" in deq_text
+    assert f"OUTPUT target {target_output}" in deq_text
+    # Every qubit the physical GADGET body actually uses these on must
+    # appear literally in the circuit (not just be well-formed integers).
+    for q in expected_target:
+        assert f" {q} " in deq_text or f" {q}\n" in deq_text or deq_text.endswith(f" {q}")
     parsed = validate_deq_text(deq_text)
     if deq_available():
         from deq.circuit.model import CodeDefinition

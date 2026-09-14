@@ -1,8 +1,8 @@
 """Export LightStim circuits to Microsoft's ``.deq`` DSL.
 
 Converts a LightStim ``QECSystem`` (for its ``CODE`` block: stabilizers and
-logical operators) plus the matching NOISELESS ``stim.Circuit`` (for the
-``GADGET`` body/bodies) into ``.deq`` text.
+logical operators) plus the matching ``stim.Circuit`` (for the ``GADGET``
+body) into ``.deq`` text.
 
 Any number of patches is supported (one ``CODE`` block + one ``OUTPUT``
 declaration per patch, in a single GADGET). Decomposing a circuit into
@@ -11,12 +11,18 @@ separate Prepare/SyndromeExtraction/Measure/merge GADGETs wired via
 onto) is still future work — see the Light-DEQ plan and the note on
 ``export_deq`` for why that split isn't just a refactor.
 
-The exported circuit is expected to be noiseless. DEQ's ``ERROR(p) <target>``
-statement only accepts CHECK/READOUT/LOGICAL targets, not per-qubit Pauli
-targets, so it is not a drop-in replacement for Stim's ``X_ERROR(p) q...``.
-Matching the convention already established by the (now-deleted)
-``surface_code_deq`` generator this replaces, LightStim should export the
-ideal circuit and treat noise injection as a separate, later concern.
+Noisy circuits export fine: deq's ``instruction`` grammar rule is a generic
+``IDENT tag? (args)? target*`` and Stim's noise channels (``X_ERROR``,
+``DEPOLARIZE1``/``DEPOLARIZE2``, etc.) are not reserved GADGET keywords, so
+they pass through as ordinary instructions — confirmed by round-tripping a
+noisy ``MemoryExperiment`` circuit through the real ``deq``/``deqagram``
+grammar. (Do not confuse this with deq's own native ``ERROR(p) <target>``
+statement, which is a different thing: it only accepts CHECK/READOUT/LOGICAL
+targets and injects a probabilistic flip on an already-abstracted outcome,
+not per-qubit physical noise — this module never emits it.) Note this
+exporter's validation is grammar-level only (round-tripped through
+``deqagram.parse``, not compiled via the Rust-toolchain-only ``deq
+transpile``), so that caveat applies equally to noisy and noiseless circuits.
 """
 
 import stim
@@ -108,17 +114,75 @@ def _infer_distance(patch):
     return None
 
 
-def _code_block_text(patch, code_name: str) -> str:
-    data_indices = sorted(patch.data_indices)
-    local_id = {qubit: i for i, qubit in enumerate(data_indices)}
-    n = len(data_indices)
+def _globalize_pauli_map(pauli_map: dict, patch_name: str, system: QECSystem) -> dict:
+    """Convert one stabilizer/logical-operator Pauli map's keys to global
+    circuit-qubit indices (i.e. the indices the physical ``stim.Circuit``
+    actually uses).
+
+    Two different per-patch representations exist in LightStim today, and
+    neither is already in global-qubit terms:
+
+    * An ordinary ``QECPatch`` (built via ``create_stim_stabilizer``/
+      ``create_stim_logical``) keys its ``.stabilizers``/``.logical_ops``
+      Pauli maps by the patch's own LOCAL qubit indices (0..n-1, as assigned
+      by the patch's own ``.build()``) — including ``patch.data_indices``
+      itself, despite it looking already-global for a first-added patch
+      (local happens to equal global there only because
+      ``QECSystem.local_to_global_map`` is the identity map for the first
+      patch added). For any later-added patch local != global, and reading
+      ``patch.data_indices``/pauli-map keys directly without converting
+      through ``system.local_to_global_map[patch_name]`` silently produces
+      the WRONG physical qubits (confirmed: a naive read had a two-patch
+      export's second patch's OUTPUT accidentally aliasing the first
+      patch's qubits).
+    * A lattice-surgery *coupler* patch (``lightstim.ir.coupler.
+      LogicalCouplerPatch``) keys its ``.stabilizers``/``.logical_ops``
+      Pauli maps by raw LOCAL COORDINATE tuples instead of even local
+      integers — a further, patch-kind-specific gap in its construction
+      (not something this module can fix at the source).
+
+    Both cases are handled here: an integer key is treated as a local
+    LightStim index and converted via ``system.local_to_global_map``; a
+    tuple key is treated as a coordinate and converted via
+    ``system.index_map`` (coordinates in a coupler patch are already
+    expressed in the system's global coordinate frame, since couplers are
+    registered with ``offset=(0, 0)``).
+    """
+    if not pauli_map:
+        return {}
+    sample_key = next(iter(pauli_map))
+    if isinstance(sample_key, tuple):
+        return {system.index_map[coord]: pauli for coord, pauli in pauli_map.items()}
+    local_to_global = system.local_to_global_map[patch_name]
+    return {local_to_global[local_idx]: pauli for local_idx, pauli in pauli_map.items()}
+
+
+def _code_qubit_universe(stabilizers: list, logical_ops: list) -> list:
+    """The full set of (already-global) qubits a patch's CODE block must
+    declare: every qubit touched by its stabilizers or logical operators."""
+    qubits = set()
+    for stabilizer in stabilizers:
+        qubits.update(stabilizer["pauli"])
+    for logical_op in logical_ops:
+        qubits.update(logical_op["pauli"])
+    return sorted(qubits)
+
+
+def _code_block_text(
+    patch, code_name: str, stabilizers: list, logical_ops: list, qubits: list
+) -> str:
+    """Render a CODE block for `patch` over the (global-index) qubit space
+    `qubits`, using already-globalized `stabilizers`/`logical_ops` (see
+    `_globalize_pauli_map`)."""
+    local_id = {qubit: i for i, qubit in enumerate(qubits)}
+    n = len(qubits)
     k = patch.num_logicals
     distance = _infer_distance(patch)
     params = f"[[{n},{k},{distance}]]" if distance is not None else f"[[{n},{k}]]"
 
     lines = [f"CODE {code_name} {params} {{"]
     if k > 0:
-        pairs = pair_logical_operators(patch.logical_ops, data_indices)
+        pairs = pair_logical_operators(logical_ops, qubits)
         if len(pairs) != k:
             raise DeqExportError(
                 f"patch {code_name!r} declares num_logicals={k} but "
@@ -128,9 +192,9 @@ def _code_block_text(patch, code_name: str) -> str:
             x_text = _pauli_product_text(x_rec["pauli"], local_id)
             z_text = _pauli_product_text(z_rec["pauli"], local_id)
             lines.append(f"    LOGICAL {x_text} {z_text}")
-    if not patch.stabilizers:
+    if not stabilizers:
         raise DeqExportError(f"patch {code_name!r} has no stabilizers to export")
-    for stabilizer in patch.stabilizers:
+    for stabilizer in stabilizers:
         lines.append(f"    STABILIZER {_pauli_product_text(stabilizer['pauli'], local_id)}")
     lines.append("}")
     return "\n".join(lines)
@@ -169,8 +233,9 @@ def export_deq(
             e.g. a two-patch transversal-gate experiment
             (``CNOTTransExperiment``) exports one ``CODE``/``OUTPUT`` pair
             per patch, both declared in the same GADGET body.
-        circuit: The NOISELESS ``stim.Circuit`` for this system (e.g.
-            ``MemoryExperiment(..., noise_params=None).build()``).
+        circuit: The ``stim.Circuit`` for this system, e.g.
+            ``MemoryExperiment(...).build()`` — noisy or noiseless, both
+            export fine (see the module docstring).
         gadget_name: Name for the single emitted GADGET.
         code_names: Optional override mapping patch name -> CODE identifier.
             Defaults to the patch name itself.
@@ -193,40 +258,32 @@ def export_deq(
         as-is) sidesteps the issue entirely: rec[-k] stays contiguous.
 
         Lattice-surgery-style protocols that register a transient *coupler*
-        patch (``QECSystem.register_coupler``) export cleanly: any patch name
-        still present in ``system.coupler_patches`` is excluded from
-        CODE/OUTPUT generation, whether or not the protocol has removed it
-        from ``system.patches`` by the time ``.build()`` returns (observed:
-        both happen, depending on the protocol). Couplers don't carry the
-        same "code the caller tracks" contract as ordinary patches anyway
-        (their ``data_indices`` aren't globalized the same way), so this is
-        the right exclusion regardless of cleanup timing. Their physical
-        qubits still appear as ordinary (unbound) wires in the GADGET body —
-        the same way the resource-superstaq reference file's own merge
-        gadgets use fresh ancilla with no ``OUTPUT``.
+        patch (``QECSystem.register_coupler``) export cleanly, including any
+        that are still live in ``system.patches``/``system.coupler_patches``
+        when ``export_deq`` runs (protocols vary on whether they remove the
+        coupler by the end of ``.build()``): a coupler patch gets its own
+        ``CODE`` block too, typically a stabilizer-state code (``k=0``, no
+        ``LOGICAL`` line), the same way the resource-superstaq reference
+        file's ``YBoundaryStateD3 [[8,0]]`` represents its own mediator
+        patch. Every patch's CODE block is built from its OWN canonical,
+        per-patch ``.stabilizers``/``.logical_ops`` (globalized on the fly —
+        see ``_globalize_pauli_map``), not from ``system.stabilizers``/
+        ``system.logical_ops``: the system-level lists track the
+        Heisenberg-EVOLVED logical frame (needed for decoding across
+        entangling gates like a transversal CNOT or a lattice-surgery
+        merge), which is the wrong thing for a CODE declaration — a CODE is
+        the code's fixed, intrinsic definition, independent of circuit
+        history. Reading the per-patch attribute instead keeps a patch's
+        CODE block stable regardless of what gates were later applied to it.
     """
-    # Coupler patches (lattice-surgery merge/split ancilla) are ephemeral:
-    # unlike ordinary code patches, they aren't guaranteed to be removed from
-    # `system.patches` by the time `.build()` returns (protocol-dependent),
-    # and even when still present their `data_indices` aren't globalized the
-    # same way (observed: raw local coordinate tuples, not global qubit
-    # ints) — they don't carry the same "code the caller tracks" contract.
-    # Exclude them from CODE/OUTPUT generation; their physical qubits still
-    # appear as ordinary (unbound) wires in the GADGET body, same as how the
-    # reference file's own merge gadgets use fresh ancilla with no OUTPUT.
-    exportable_patches = {
-        name: entry
-        for name, entry in system.patches.items()
-        if name not in system.coupler_patches
-    }
-    if not exportable_patches:
-        raise DeqExportError("system has no exportable (non-coupler) patches")
+    if not system.patches:
+        raise DeqExportError("system has no patches to export")
 
     code_names = code_names or {}
     sections = []
     output_ports = []
     seen_code_names: dict = {}
-    for patch_name, (patch, _offset) in exportable_patches.items():
+    for patch_name, (patch, _offset) in system.patches.items():
         code_name = code_names.get(patch_name, patch_name)
         if code_name in seen_code_names:
             raise DeqExportError(
@@ -234,8 +291,17 @@ def export_deq(
                 f"CODE name {code_name!r}; pass `code_names` to disambiguate."
             )
         seen_code_names[code_name] = patch_name
-        sections.append(_code_block_text(patch, code_name))
-        output_ports.append((code_name, sorted(patch.data_indices)))
+        stabilizers = [
+            {**s, "pauli": _globalize_pauli_map(s["pauli"], patch_name, system)}
+            for s in patch.stabilizers
+        ]
+        logical_ops = [
+            {**lo, "pauli": _globalize_pauli_map(lo["pauli"], patch_name, system)}
+            for lo in patch.logical_ops
+        ]
+        qubits = _code_qubit_universe(stabilizers, logical_ops)
+        sections.append(_code_block_text(patch, code_name, stabilizers, logical_ops, qubits))
+        output_ports.append((code_name, qubits))
 
     sections.append(_gadget_block_text(gadget_name, circuit, output_ports=output_ports))
 
