@@ -13,6 +13,7 @@ Sweep experiments belong in `benchmarks/`, not here.
 ```
 notebooks/
 ├── CrossLS/          Surface–PQRM lattice surgery
+├── DEQ/              Export to Microsoft's .deq DSL (qdk-ec)
 ├── LogicalCircuits/  Bell teleportation, GHZ prep, magic-state distillation
 ├── LogicalOps/       Single-qubit logical gates, lattice surgery, state injection
 ├── Memory/           Memory experiments across all supported QEC codes
@@ -26,6 +27,12 @@ notebooks/
 | Notebook | Protocol | Description |
 |---|---|---|
 | `cross_ls.ipynb` | `lightstim/protocols/cross_ls/` | Surface ↔ PQRM lattice surgery; detector slices and small LER sweep |
+
+### DEQ/
+
+| Notebook | Package | Description |
+|---|---|---|
+| `deq_export_demo.ipynb` | `lightstim/deq/` | Export a repetition-code and a rotated-surface-code memory circuit to `.deq`; validates against the real `deq`/`deqagram` grammar and compares against the resource-superstaq reference file |
 
 ### LogicalCircuits/
 
