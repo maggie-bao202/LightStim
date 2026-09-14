@@ -192,14 +192,108 @@ GADGET Test {
     assert len(readouts) == 2  # one per LOGICAL, in declaration order
 
 
-# --- multi-patch scope guard -------------------------------------------------
+# --- multi-patch export -----------------------------------------------------
 
 @pytest.mark.smoke
-def test_multi_patch_raises_not_implemented():
+def test_empty_system_raises():
+    import stim
+
+    system = QECSystem()
+    with pytest.raises(DeqExportError):
+        export_deq(system, stim.Circuit(), gadget_name="X")
+
+
+@pytest.mark.smoke
+def test_duplicate_code_name_raises():
     import stim
 
     system = QECSystem()
     system.add_patch(RepetitionCode(distance=3), name="a")
     system.add_patch(RepetitionCode(distance=3), name="b", offset=(0, 10))
     with pytest.raises(DeqExportError):
-        export_deq(system, stim.Circuit(), gadget_name="X")
+        export_deq(
+            system,
+            stim.Circuit(),
+            gadget_name="X",
+            code_names={"a": "same", "b": "same"},
+        )
+
+
+@pytest.mark.smoke
+class TestExportTwoPersistingPatches:
+    """Two independent, persisting patches (no coupler) — CNOTTransExperiment."""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def deq_text():
+        from lightstim.protocols.cnot_trans import CNOTTransExperiment
+
+        exp = CNOTTransExperiment(
+            code_patch_class=RotatedSurfaceCode,
+            extraction_block_class=RotatedSurfaceCodeExtractionBlock,
+            code_params_control={"distance": 3},
+            rounds_before=1,
+            rounds_after=1,
+            noise_params=None,
+        )
+        circuit = exp.build()
+        return export_deq(exp.system, circuit, gadget_name="CNOTTrans")
+
+    def test_two_code_blocks(self, deq_text):
+        assert deq_text.count("CODE ") == 2
+        assert "CODE control [[9,1,3]] {" in deq_text
+        assert "CODE target [[9,1,3]] {" in deq_text
+
+    def test_one_gadget_two_outputs(self, deq_text):
+        assert deq_text.count("GADGET ") == 1
+        assert deq_text.count("OUTPUT ") == 2
+
+    def test_validates_structurally(self, deq_text):
+        parsed = validate_deq_text(deq_text)
+        if deq_available():
+            from deq.circuit.model import CodeDefinition, GadgetDefinition
+            codes = {d.name: d for d in parsed.definitions if isinstance(d, CodeDefinition)}
+            assert set(codes) == {"control", "target"}
+            for c in codes.values():
+                assert (c.n, c.k, c.d) == (9, 1, 3)
+                assert len(c.stabilizers) == 8
+            gadget = next(d for d in parsed.definitions if isinstance(d, GadgetDefinition))
+            assert len(gadget.output_ports) == 2
+
+
+@pytest.mark.smoke
+def test_coupler_patch_excluded_from_export():
+    """Lattice-surgery coupler patches are ephemeral merge/split ancilla, not
+    tracked codes: export_deq must exclude them from CODE/OUTPUT generation
+    even when the protocol leaves them in system.patches after .build()."""
+    import contextlib
+    import io
+
+    from lightstim.protocols.two_patch_ls import TwoPatchLSExperiment
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        exp = TwoPatchLSExperiment(
+            patch1_config={"distance": 3},
+            patch2_config={"distance": 3},
+            offset=(0, 10),
+            interaction_type="ZZ",
+            initial_state_patch1="X",
+            initial_state_patch2="Z",
+            measure_state_patch1="X",
+            measure_state_patch2="Z",
+            rounds=1,
+            noise_params=None,
+        )
+        circuit = exp.build()
+
+    assert exp.system.coupler_patches, "test assumes the coupler is still present after build()"
+    deq_text = export_deq(exp.system, circuit, gadget_name="TwoPatchLS")
+
+    assert deq_text.count("CODE ") == 2  # coupler excluded
+    for coupler_name in exp.system.coupler_patches:
+        assert coupler_name not in deq_text
+    parsed = validate_deq_text(deq_text)
+    if deq_available():
+        from deq.circuit.model import CodeDefinition
+        codes = [d for d in parsed.definitions if isinstance(d, CodeDefinition)]
+        assert len(codes) == 2

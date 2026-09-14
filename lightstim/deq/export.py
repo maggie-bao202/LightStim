@@ -4,9 +4,12 @@ Converts a LightStim ``QECSystem`` (for its ``CODE`` block: stabilizers and
 logical operators) plus the matching NOISELESS ``stim.Circuit`` (for the
 ``GADGET`` body/bodies) into ``.deq`` text.
 
-Scope (v1): single-patch systems only (the common ``MemoryExperiment``
-case). Multi-patch export (lattice surgery, code deformation) is future
-work — see the Light-DEQ plan.
+Any number of patches is supported (one ``CODE`` block + one ``OUTPUT``
+declaration per patch, in a single GADGET). Decomposing a circuit into
+separate Prepare/SyndromeExtraction/Measure/merge GADGETs wired via
+``COMPOSE`` (as LightStim's lattice-surgery protocols would naturally map
+onto) is still future work — see the Light-DEQ plan and the note on
+``export_deq`` for why that split isn't just a refactor.
 
 The exported circuit is expected to be noiseless. DEQ's ``ERROR(p) <target>``
 statement only accepts CHECK/READOUT/LOGICAL targets, not per-qubit Pauli
@@ -137,16 +140,14 @@ def _gadget_block_text(
     name: str,
     body: "stim.Circuit",
     *,
-    input_port: tuple | None = None,
-    output_port: tuple | None = None,
+    input_ports: list = (),
+    output_ports: list = (),
 ) -> str:
     lines = [f"GADGET {name} {{"]
-    if input_port is not None:
-        code_name, qubits = input_port
+    for code_name, qubits in input_ports:
         lines.append(f"    INPUT {code_name} {' '.join(str(q) for q in qubits)}")
     lines.extend(_circuit_lines(body, indent=1))
-    if output_port is not None:
-        code_name, qubits = output_port
+    for code_name, qubits in output_ports:
         lines.append(f"    OUTPUT {code_name} {' '.join(str(q) for q in qubits)}")
     lines.append("}")
     return "\n".join(lines)
@@ -159,12 +160,15 @@ def export_deq(
     gadget_name: str = "Circuit",
     code_names: dict | None = None,
 ) -> str:
-    """Export a single-patch LightStim circuit to ``.deq`` text.
+    """Export a LightStim circuit to ``.deq`` text.
 
     Args:
-        system: A ``QECSystem`` with exactly one patch (the common
-            ``MemoryExperiment(qec_patch=...)`` case). Multi-patch export
-            is not yet supported.
+        system: A ``QECSystem`` with one or more patches. Each patch becomes
+            its own ``CODE`` block (with its own local qubit numbering) and
+            its own ``OUTPUT`` declaration in the single emitted GADGET —
+            e.g. a two-patch transversal-gate experiment
+            (``CNOTTransExperiment``) exports one ``CODE``/``OUTPUT`` pair
+            per patch, both declared in the same GADGET body.
         circuit: The NOISELESS ``stim.Circuit`` for this system (e.g.
             ``MemoryExperiment(..., noise_params=None).build()``).
         gadget_name: Name for the single emitted GADGET.
@@ -187,21 +191,53 @@ def export_deq(
         currently expose — real design work, tracked as follow-up. Keeping
         everything in one GADGET (with Stim's native REPEAT block preserved
         as-is) sidesteps the issue entirely: rec[-k] stays contiguous.
-    """
-    if len(system.patches) != 1:
-        raise DeqExportError(
-            f"export_deq only supports single-patch systems for now; got "
-            f"{len(system.patches)} patches ({sorted(system.patches)}). "
-            "Multi-patch export is future work."
-        )
-    (patch_name, (patch, _offset)) = next(iter(system.patches.items()))
-    code_name = (code_names or {}).get(patch_name, patch_name)
-    output_qubits = sorted(patch.data_indices)
 
-    sections = [
-        _code_block_text(patch, code_name),
-        _gadget_block_text(gadget_name, circuit, output_port=(code_name, output_qubits)),
-    ]
+        Lattice-surgery-style protocols that register a transient *coupler*
+        patch (``QECSystem.register_coupler``) export cleanly: any patch name
+        still present in ``system.coupler_patches`` is excluded from
+        CODE/OUTPUT generation, whether or not the protocol has removed it
+        from ``system.patches`` by the time ``.build()`` returns (observed:
+        both happen, depending on the protocol). Couplers don't carry the
+        same "code the caller tracks" contract as ordinary patches anyway
+        (their ``data_indices`` aren't globalized the same way), so this is
+        the right exclusion regardless of cleanup timing. Their physical
+        qubits still appear as ordinary (unbound) wires in the GADGET body —
+        the same way the resource-superstaq reference file's own merge
+        gadgets use fresh ancilla with no ``OUTPUT``.
+    """
+    # Coupler patches (lattice-surgery merge/split ancilla) are ephemeral:
+    # unlike ordinary code patches, they aren't guaranteed to be removed from
+    # `system.patches` by the time `.build()` returns (protocol-dependent),
+    # and even when still present their `data_indices` aren't globalized the
+    # same way (observed: raw local coordinate tuples, not global qubit
+    # ints) — they don't carry the same "code the caller tracks" contract.
+    # Exclude them from CODE/OUTPUT generation; their physical qubits still
+    # appear as ordinary (unbound) wires in the GADGET body, same as how the
+    # reference file's own merge gadgets use fresh ancilla with no OUTPUT.
+    exportable_patches = {
+        name: entry
+        for name, entry in system.patches.items()
+        if name not in system.coupler_patches
+    }
+    if not exportable_patches:
+        raise DeqExportError("system has no exportable (non-coupler) patches")
+
+    code_names = code_names or {}
+    sections = []
+    output_ports = []
+    seen_code_names: dict = {}
+    for patch_name, (patch, _offset) in exportable_patches.items():
+        code_name = code_names.get(patch_name, patch_name)
+        if code_name in seen_code_names:
+            raise DeqExportError(
+                f"patches {seen_code_names[code_name]!r} and {patch_name!r} both map to "
+                f"CODE name {code_name!r}; pass `code_names` to disambiguate."
+            )
+        seen_code_names[code_name] = patch_name
+        sections.append(_code_block_text(patch, code_name))
+        output_ports.append((code_name, sorted(patch.data_indices)))
+
+    sections.append(_gadget_block_text(gadget_name, circuit, output_ports=output_ports))
 
     header = "# Generated by lightstim.deq.export; do not edit by hand."
     return header + "\n\n" + "\n\n".join(sections) + "\n"
