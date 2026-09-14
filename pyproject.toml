@@ -53,6 +53,13 @@ decoders = [
 gpu = [
     "cudaq-qec",
 ]
+deq = [
+    # Microsoft's qdk-ec toolkit (github.com/microsoft/qdk-ec) — real,
+    # normally-installable PyPI packages. `deqagram` ships a prebuilt wheel,
+    # so no Rust toolchain is needed just to validate exported .deq text.
+    "deq>=0.4",
+    "deqagram>=0.4",
+]
 dev = [
     "pytest",
     "jupyter",
